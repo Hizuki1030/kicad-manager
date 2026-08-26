@@ -65,7 +65,8 @@ function padTo(s: string, width: number): string {
 function computeWidths(cols: TableCol[], rows: string[][]): { widths: number[]; flexIdx: number } {
   const termWidth = Math.max(50, Math.min(process.stdout.columns ?? 100, 200));
   const n = cols.length;
-  const sep = "  ";
+  const sepLen = 2;
+  const FLEX_MIN = 8;
 
   const widths = cols.map((c, i) => {
     const natural = Math.max(displayWidth(c.header), ...rows.map((r) => displayWidth(r[i] ?? "")));
@@ -73,9 +74,23 @@ function computeWidths(cols: TableCol[], rows: string[][]): { widths: number[]; 
   });
 
   const flexIdx = cols.findIndex((c) => c.flex);
+
+  let fixedUsed = sepLen * (n - 1);
+  for (let i = 0; i < n; i++) {
+    if (i !== flexIdx) fixedUsed += widths[i];
+  }
+
   if (flexIdx >= 0) {
-    const fixedUsed = widths.reduce((a, b) => a + b, 0) + sep.length * (n - 1);
-    widths[flexIdx] = Math.max(8, Math.min(widths[flexIdx], termWidth - (fixedUsed - widths[flexIdx])));
+    if (termWidth - fixedUsed < FLEX_MIN) {
+      const target = termWidth - FLEX_MIN - sepLen * (n - 1);
+      const fixedTotal = fixedUsed - sepLen * (n - 1);
+      const scale = target / fixedTotal;
+      for (let i = 0; i < n; i++) {
+        if (i !== flexIdx) widths[i] = Math.max(1, Math.floor(widths[i] * scale));
+      }
+      fixedUsed = termWidth - FLEX_MIN;
+    }
+    widths[flexIdx] = Math.max(FLEX_MIN, Math.min(widths[flexIdx], termWidth - fixedUsed));
   }
   return { widths, flexIdx };
 }
@@ -126,10 +141,9 @@ function selectFromTable(
   const total = rows.length;
   return new Promise((resolve) => {
     let idx = 0;
-    const { widths, flexIdx } = computeWidths(cols, rows);
-    const table = renderTable(cols, rows);
-    const termHeight = process.stdout.rows ?? 24;
-    const maxVisible = Math.max(5, Math.min(total, termHeight - 4));
+    let { widths, flexIdx } = computeWidths(cols, rows);
+    let table = renderTable(cols, rows);
+    let maxVisible = Math.max(5, Math.min(total, (process.stdout.rows ?? 24) - 4));
 
     const TICK_MS = 90;
     const STEP = 2;
@@ -139,6 +153,19 @@ function selectFromTable(
     let direction = 1;
     let pause = 0;
     let timer: NodeJS.Timeout | null = null;
+
+    const recalcLayout = () => {
+      ({ widths, flexIdx } = computeWidths(cols, rows));
+      table = renderTable(cols, rows);
+      maxVisible = Math.max(5, Math.min(total, (process.stdout.rows ?? 24) - 4));
+    };
+
+    const onResize = () => {
+      recalcLayout();
+      resetMarquee();
+      process.stdout.write("\x1b[2J\x1b[H");
+      render();
+    };
 
     const startOf = () =>
       Math.min(
@@ -211,6 +238,7 @@ function selectFromTable(
     process.stdin.resume();
     render();
     timer = setInterval(tick, TICK_MS);
+    process.stdout.on("resize", onResize);
 
     const onKey = (str: string, key: readline.Key) => {
       if (key.ctrl && key.name === "c") {
@@ -244,6 +272,7 @@ function selectFromTable(
 
     const cleanup = () => {
       if (timer) clearInterval(timer);
+      process.stdout.removeListener("resize", onResize);
       process.stdin.removeListener("keypress", onKey);
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
       process.stdin.pause();

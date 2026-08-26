@@ -34,10 +34,15 @@ cd test_project
 # 3) ライブラリ検索 (表形式表示・矢印キーで選択、選択行の説明は自動スクロール)
 kicad-manager search esp32
 kicad-manager search esp32 --json      # JSON で結果を出力
+kicad-manager search esp32 --all       # 全ページ検索 (デフォルトは最大75件)
+kicad-manager search esp32 --limit 100
+
+# 表の URL 列はクリック可能 (対応ターミナル)。選択中に o キーでブラウザを開ける
 
 # 4) 部品を追加 (シンボル・フットプリント・3D モデルを lib/ に配置)
 kicad-manager add esp32s3               # あいまい検索 → 選択
 kicad-manager add esp32s3 --manufacturer Espressif
+kicad-manager add esp32s3 --all         # 全ページから検索
 kicad-manager add --id <SamacSys Part ID>   # 検索をスキップして直接ダウンロード
 
 # その他

@@ -13,6 +13,10 @@ export interface PartResult {
   hasModel: boolean;
 }
 
+export function partViewUrl(mpn: string, manufacturer: string): string {
+  return `${BASE}/part-view/${encodeURI(mpn)}/${encodeURI(manufacturer)}`;
+}
+
 function decodeEntities(s: string): string {
   return s
     .replace(/&#(\d+);/g, (_m, d) => String.fromCodePoint(Number(d)))
@@ -31,7 +35,7 @@ export function parseSearchResults(html: string): PartResult[] {
   const rows = html.split("<tr id='row-").slice(1);
   for (const row of rows) {
     const chunk = row.split("</tr>")[0];
-    const uid = chunk.match(/data-uid="(\d+)"/)?.[1] ?? "";
+    const uid = chunk.match(/data-uid="(-?\d+)"/)?.[1] ?? "";
     const partLink = chunk.match(/class="part-number"[^>]*>\s*([^<]+?)\s*<\/a>/);
     const mpn = partLink ? decodeEntities(partLink[1].trim()) : "";
     const manuf = chunk.match(/<span class="grey-text">\s*([^<]+?)\s*<\/span>/);
@@ -40,31 +44,71 @@ export function parseSearchResults(html: string): PartResult[] {
     const description = desc ? decodeEntities(desc[1].trim()) : "";
     const pkg = chunk.match(/<span class="td-package-category">([^<]*)<\/span>/);
     const packageName = pkg ? decodeEntities(pkg[1].trim()) : "";
-    const hasModel = /ecad-icon-wrapper/.test(chunk);
+    const hasModel = /ecad-icon-wrapper/.test(chunk) && !uid.startsWith("-");
     if (!uid && !mpn) continue;
     results.push({ uid, mpn, manufacturer, description, package: packageName, hasModel });
   }
   return results;
 }
 
-export async function search(term: string): Promise<PartResult[]> {
-  const url = `${BASE}/search?term=${encodeURIComponent(term)}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-  if (res.status === 403) {
-    throw new Error(
-      "Search blocked by Component Search Engine (HTTP 403). Try again, or use 'kicad-manager add --id <partID>' with an ID from componentsearchengine.com."
-    );
+export interface SearchResultSet {
+  results: PartResult[];
+  total: number;
+  fetchedPages: number;
+}
+
+const PER_PAGE = 25;
+const MAX_PAGES = 40;
+
+export async function search(
+  term: string,
+  opts: { limit?: number } = {}
+): Promise<SearchResultSet> {
+  const limit = opts.limit ?? 3 * PER_PAGE;
+  const maxPages = Number.isFinite(limit) ? Math.max(1, Math.ceil(limit / PER_PAGE)) : MAX_PAGES;
+  const all: PartResult[] = [];
+  const seen = new Set<string>();
+  let total = 0;
+  let fetchedPages = 0;
+
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `${BASE}/search?term=${encodeURIComponent(term)}&page=${page}`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    if (res.status === 403) {
+      throw new Error(
+        "Search blocked by Component Search Engine (HTTP 403). Try again, or use 'kicad-manager add --id <partID>' with an ID from componentsearchengine.com."
+      );
+    }
+    if (!res.ok) {
+      if (page === 1) throw new Error(`Search failed (HTTP ${res.status})`);
+      break;
+    }
+    const html = await res.text();
+    if (page === 1) {
+      const m = html.match(/of <strong>(\d+) results/);
+      total = m ? parseInt(m[1], 10) : 0;
+    }
+    const results = parseSearchResults(html);
+    if (results.length === 0) break;
+
+    let added = 0;
+    for (const r of results) {
+      if (seen.has(r.uid)) continue;
+      seen.add(r.uid);
+      all.push(r);
+      added++;
+    }
+    fetchedPages = page;
+    if (added === 0 || results.length < PER_PAGE) break;
+    if (Number.isFinite(limit) && all.length >= limit) break;
   }
-  if (!res.ok) {
-    throw new Error(`Search failed (HTTP ${res.status})`);
-  }
-  return parseSearchResults(await res.text());
+  return { results: all, total, fetchedPages };
 }
 
 export async function getSamacId(mpn: string, manufacturer: string): Promise<string | null> {

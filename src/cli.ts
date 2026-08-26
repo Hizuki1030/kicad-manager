@@ -2,15 +2,22 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { loadConfig, saveConfig, resolveCredentials, isLoggedIn } from "./config.js";
 import { createProject, findProjectRoot, projectPaths, readSymbolLibBlocks, symbolNameOf } from "./kicad.js";
-import { search, downloadZip, getSamacId, PartResult } from "./cse.js";
+import { search, downloadZip, getSamacId, partViewUrl, PartResult } from "./cse.js";
 import { importZipIntoProject } from "./import.js";
 
 function fail(msg: string): never {
   process.stderr.write("error: " + msg + "\n");
   process.exit(1);
+}
+
+function openUrl(url: string): void {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
 }
 
 // ---------------------------------------------------------------------------
@@ -21,6 +28,13 @@ interface TableCol {
   header: string;
   cap: number; // max width for fixed columns
   flex?: boolean; // take remaining terminal width (truncated)
+  min?: number; // never shrink below this width
+}
+
+type Cell = string | { url: string };
+
+function cellText(c: Cell): string {
+  return typeof c === "string" ? c : c.url;
 }
 
 function displayWidth(s: string): number {
@@ -62,14 +76,14 @@ function padTo(s: string, width: number): string {
   return s + " ".repeat(Math.max(0, width - displayWidth(s)));
 }
 
-function computeWidths(cols: TableCol[], rows: string[][]): { widths: number[]; flexIdx: number } {
+function computeWidths(cols: TableCol[], rows: Cell[][]): { widths: number[]; flexIdx: number } {
   const termWidth = Math.max(50, Math.min(process.stdout.columns ?? 100, 200));
   const n = cols.length;
   const sepLen = 2;
-  const FLEX_MIN = 8;
+  const FLEX_MIN = 10;
 
   const widths = cols.map((c, i) => {
-    const natural = Math.max(displayWidth(c.header), ...rows.map((r) => displayWidth(r[i] ?? "")));
+    const natural = Math.max(displayWidth(c.header), ...rows.map((r) => displayWidth(cellText(r[i] ?? ""))));
     return c.flex ? natural : Math.min(natural, c.cap);
   });
 
@@ -86,37 +100,44 @@ function computeWidths(cols: TableCol[], rows: string[][]): { widths: number[]; 
       const fixedTotal = fixedUsed - sepLen * (n - 1);
       const scale = target / fixedTotal;
       for (let i = 0; i < n; i++) {
-        if (i !== flexIdx) widths[i] = Math.max(1, Math.floor(widths[i] * scale));
+        if (i !== flexIdx) widths[i] = Math.max(cols[i].min ?? 1, Math.floor(widths[i] * scale));
       }
-      fixedUsed = termWidth - FLEX_MIN;
+      fixedUsed = sepLen * (n - 1);
+      for (let i = 0; i < n; i++) {
+        if (i !== flexIdx) fixedUsed += widths[i];
+      }
     }
     widths[flexIdx] = Math.max(FLEX_MIN, Math.min(widths[flexIdx], termWidth - fixedUsed));
   }
   return { widths, flexIdx };
 }
 
-function formatRow(cells: string[], widths: number[], flexIdx: number): string {
+function formatRow(cells: Cell[], widths: number[], flexIdx: number, links: boolean): string {
   return cells
     .map((cell, i) => {
-      const t = truncateTo(cell, widths[i]);
-      return i === flexIdx || i === widths.length - 1 ? t : padTo(t, widths[i]);
+      const plain = cellText(cell);
+      const t = truncateTo(plain, widths[i]);
+      const isLink = typeof cell !== "string";
+      const rendered = isLink && links ? `\x1b]8;;${cell.url}\x1b\\${t}\x1b]8;;\x1b\\` : t;
+      return i === flexIdx || i === widths.length - 1 ? rendered : padTo(rendered, widths[i]);
     })
     .join("  ")
     .trimEnd();
 }
 
-function renderTable(cols: TableCol[], rows: string[][]): string[] {
+function renderTable(cols: TableCol[], rows: Cell[][], links = false): string[] {
   const { widths, flexIdx } = computeWidths(cols, rows);
   const lines: string[] = [];
-  lines.push(formatRow(cols.map((c) => c.header), widths, flexIdx));
+  lines.push(formatRow(cols.map((c) => c.header), widths, flexIdx, links));
   lines.push(
     formatRow(
       cols.map((c, i) => "─".repeat(Math.max(1, Math.min(widths[i], displayWidth(c.header) + 4)))),
       widths,
-      flexIdx
+      flexIdx,
+      links
     )
   );
-  for (const r of rows) lines.push(formatRow(r, widths, flexIdx));
+  for (const r of rows) lines.push(formatRow(r, widths, flexIdx, links));
   return lines;
 }
 
@@ -135,14 +156,15 @@ function windowText(text: string, startChar: number, width: number): string {
 
 function selectFromTable(
   cols: TableCol[],
-  rows: string[][],
-  marquee: string[] | null = null
+  rows: Cell[][],
+  marquee: string[] | null = null,
+  openUrls: string[] | null = null
 ): Promise<number | null> {
   const total = rows.length;
   return new Promise((resolve) => {
     let idx = 0;
     let { widths, flexIdx } = computeWidths(cols, rows);
-    let table = renderTable(cols, rows);
+    let table = renderTable(cols, rows, true);
     let maxVisible = Math.max(5, Math.min(total, (process.stdout.rows ?? 24) - 4));
 
     const TICK_MS = 90;
@@ -156,7 +178,7 @@ function selectFromTable(
 
     const recalcLayout = () => {
       ({ widths, flexIdx } = computeWidths(cols, rows));
-      table = renderTable(cols, rows);
+      table = renderTable(cols, rows, true);
       maxVisible = Math.max(5, Math.min(total, (process.stdout.rows ?? 24) - 4));
     };
 
@@ -180,7 +202,7 @@ function selectFromTable(
         if (displayWidth(text) > widths[flexIdx]) {
           const cells = rows[k].slice();
           cells[flexIdx] = windowText(text, offset, widths[flexIdx]);
-          line = formatRow(cells, widths, flexIdx);
+          line = formatRow(cells, widths, flexIdx, true);
         }
       }
       return k === idx ? "\x1b[7m" + line + "\x1b[0m" : line;
@@ -188,7 +210,9 @@ function selectFromTable(
 
     const render = () => {
       const start = startOf();
-      const promptLine = `Use \u2191/\u2193 to move, Enter to select, q to cancel  [${idx + 1}/${total}]`;
+      const promptLine = openUrls
+        ? `Use \u2191/\u2193 to move, Enter to select, o to open URL, q to cancel  [${idx + 1}/${total}]`
+        : `Use \u2191/\u2193 to move, Enter to select, q to cancel  [${idx + 1}/${total}]`;
       readline.cursorTo(process.stdout, 0, 0);
       const out: string[] = [];
       out.push(table[0]);
@@ -257,6 +281,13 @@ function selectFromTable(
           idx = (idx + 1) % total;
           resetMarquee();
           render();
+          break;
+        case "o":
+          if (openUrls && openUrls[idx]) {
+            openUrl(openUrls[idx]);
+            resetMarquee();
+            render();
+          }
           break;
         case "return":
         case "enter":
@@ -338,20 +369,20 @@ async function confirm(q: string): Promise<boolean> {
 function partTableCols(): TableCol[] {
   return [
     { header: "#", cap: 3 },
-    { header: "Part Number", cap: 36 },
-    { header: "Manufacturer", cap: 24 },
-    { header: "Package", cap: 20 },
-    { header: "Model", cap: 5 },
+    { header: "Part Number", cap: 32, min: 10 },
+    { header: "Manufacturer", cap: 20, min: 8 },
+    { header: "URL", cap: 34, min: 20 },
+    { header: "Model", cap: 5, min: 5 },
     { header: "Description", cap: Infinity, flex: true },
   ];
 }
 
-function partTableRows(results: PartResult[]): string[][] {
+function partTableRows(results: PartResult[]): Cell[][] {
   return results.map((r, i) => [
     String(i + 1),
     r.mpn,
     r.manufacturer,
-    r.package,
+    { url: partViewUrl(r.mpn, r.manufacturer) },
     r.hasModel ? "\u2713" : "\u2717",
     r.description,
   ]);
@@ -363,7 +394,12 @@ async function choosePart(results: PartResult[]): Promise<PartResult | null> {
 
   if (process.stdin.isTTY && process.stdout.isTTY) {
     process.stdout.write("\n");
-    const idx = await selectFromTable(cols, rows, results.map((r) => r.description));
+    const idx = await selectFromTable(
+      cols,
+      rows,
+      results.map((r) => r.description),
+      results.map((r) => partViewUrl(r.mpn, r.manufacturer))
+    );
     if (idx === null) return null;
     return results[idx];
   }
@@ -409,21 +445,40 @@ async function cmdLogin(opts: { username?: string; password?: string }) {
   process.stdout.write(`Saved credentials to ~/.config/kicad-manager/config.json (chmod 600).\n`);
 }
 
-async function cmdSearch(term: string | undefined, opts: { json?: boolean; add?: boolean }) {
+interface SearchOpts {
+  limit?: string;
+  all?: boolean;
+}
+
+function searchLimit(opts: SearchOpts): number {
+  if (opts.all) return Infinity;
+  if (opts.limit) {
+    const n = parseInt(opts.limit, 10);
+    if (Number.isInteger(n) && n > 0) return n;
+    fail(`Invalid --limit value: ${opts.limit}`);
+  }
+  return 75;
+}
+
+async function cmdSearch(term: string | undefined, opts: { json?: boolean; add?: boolean; limit?: string; all?: boolean }) {
   if (!term) fail("Search term is required.");
   process.stdout.write(`Searching Component Search Engine for "${term}"...\n`);
-  const results = await search(term);
+  const { results, total } = await search(term, { limit: searchLimit(opts) });
   if (results.length === 0) {
     process.stdout.write("No results found.\n");
     return;
   }
 
   if (opts.json) {
-    process.stdout.write(JSON.stringify(results, null, 2) + "\n");
+    process.stdout.write(JSON.stringify({ total, count: results.length, results }, null, 2) + "\n");
     return;
   }
 
-  process.stdout.write(`Found ${results.length} result(s):\n\n`);
+  if (total > results.length) {
+    process.stdout.write(`Found ${results.length} of ${total} result(s) (use --all to fetch all):\n\n`);
+  } else {
+    process.stdout.write(`Found ${results.length} result(s):\n\n`);
+  }
   const chosen = await choosePart(results);
   if (!chosen) {
     process.stdout.write("Cancelled.\n");
@@ -437,7 +492,10 @@ async function cmdSearch(term: string | undefined, opts: { json?: boolean; add?:
   await downloadAndInstall({ mpn: chosen.mpn, manufacturer: chosen.manufacturer }, partLabel(chosen));
 }
 
-async function cmdAdd(term: string | undefined, opts: { id?: string; manufacturer?: string }) {
+async function cmdAdd(
+  term: string | undefined,
+  opts: { id?: string; manufacturer?: string; limit?: string; all?: boolean }
+) {
   if (!term && !opts.id) fail("A part number (or --id) is required.");
 
   const root = findProjectRoot(process.cwd());
@@ -455,7 +513,7 @@ async function cmdAdd(term: string | undefined, opts: { id?: string; manufacture
 
   const query = term as string;
   process.stdout.write(`Searching for "${query}"...\n`);
-  const results = await search(query);
+  const { results, total } = await search(query, { limit: searchLimit(opts) });
   if (results.length === 0) fail(`No results for "${query}".`);
 
   let chosen: PartResult | undefined;
@@ -467,6 +525,9 @@ async function cmdAdd(term: string | undefined, opts: { id?: string; manufacture
   }
   if (!chosen && results.length === 1) chosen = results[0];
   if (!chosen) {
+    if (total > results.length) {
+      process.stdout.write(`No exact match in first ${results.length} of ${total} results. Try --all for a full search.\n`);
+    }
     process.stdout.write(`Multiple matches for "${term}":\n`);
     chosen = (await choosePart(results)) ?? undefined;
     if (!chosen) {
@@ -569,6 +630,8 @@ program
   .argument("<term>", "search term (e.g. esp32)")
   .option("--json", "print raw JSON results instead of an interactive list")
   .option("--add", "skip the confirmation prompt and go straight to adding")
+  .option("--limit <n>", "maximum number of results to fetch (default: 75)")
+  .option("--all", "fetch all search results")
   .action((term, opts) => cmdSearch(term, opts));
 
 program
@@ -577,6 +640,8 @@ program
   .argument("[term]", "manufacturer part number or keyword")
   .option("--id <uid>", "SamacSys part ID for direct download (bypasses search)")
   .option("-m, --manufacturer <mfr>", "manufacturer filter")
+  .option("--limit <n>", "maximum number of search results to fetch (default: 75)")
+  .option("--all", "search through all results")
   .action((term, opts) => cmdAdd(term, opts));
 
 program

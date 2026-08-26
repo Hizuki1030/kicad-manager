@@ -1,0 +1,29 @@
+{
+  "name": "kicad-manager",
+  "version": "0.1.0",
+  "description": "Library Loader compatible CLI for KiCad projects (Component Search Engine integration)",
+  "type": "module",
+  "bin": {
+    "kicad-manager": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "commander": "^13.1.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}

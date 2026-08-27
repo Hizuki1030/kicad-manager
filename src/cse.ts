@@ -60,6 +60,35 @@ export interface SearchResultSet {
 const PER_PAGE = 25;
 const MAX_PAGES = 40;
 
+export interface SearchPage {
+  results: PartResult[];
+  total: number;
+}
+
+export async function searchPage(term: string, page: number): Promise<SearchPage> {
+  const url = `${BASE}/search?term=${encodeURIComponent(term)}&page=${page}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  });
+  if (res.status === 403) {
+    throw new Error(
+      "Search blocked by Component Search Engine (HTTP 403). Try again, or use 'kicad-manager add --id <partID>' with an ID from componentsearchengine.com."
+    );
+  }
+  if (!res.ok) {
+    if (page === 1) throw new Error(`Search failed (HTTP ${res.status})`);
+    return { results: [], total: 0 };
+  }
+  const html = await res.text();
+  const m = html.match(/of <strong>(\d+) results/);
+  const total = m ? parseInt(m[1], 10) : 0;
+  return { results: parseSearchResults(html), total };
+}
+
 export async function search(
   term: string,
   opts: { limit?: number } = {}
@@ -72,29 +101,8 @@ export async function search(
   let fetchedPages = 0;
 
   for (let page = 1; page <= maxPages; page++) {
-    const url = `${BASE}/search?term=${encodeURIComponent(term)}&page=${page}`;
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    if (res.status === 403) {
-      throw new Error(
-        "Search blocked by Component Search Engine (HTTP 403). Try again, or use 'kicad-manager add --id <partID>' with an ID from componentsearchengine.com."
-      );
-    }
-    if (!res.ok) {
-      if (page === 1) throw new Error(`Search failed (HTTP ${res.status})`);
-      break;
-    }
-    const html = await res.text();
-    if (page === 1) {
-      const m = html.match(/of <strong>(\d+) results/);
-      total = m ? parseInt(m[1], 10) : 0;
-    }
-    const results = parseSearchResults(html);
+    const { results, total: pageTotal } = await searchPage(term, page);
+    if (page === 1) total = pageTotal;
     if (results.length === 0) break;
 
     let added = 0;

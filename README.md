@@ -32,12 +32,13 @@ kicad-manager create test_project
 cd test_project
 
 # 3) ライブラリ検索 (表形式表示・矢印キーで選択、選択行の説明は自動スクロール)
+#    下端までスクロールすると自動で次の25件を読み込み (検索中スピナー表示)
 kicad-manager search esp32
 kicad-manager search esp32 --json      # JSON で結果を出力
-kicad-manager search esp32 --all       # 全ページ検索 (デフォルトは最大75件)
-kicad-manager search esp32 --limit 100
+kicad-manager search esp32 --limit 100 # 読み込み件数を制限
+kicad-manager search esp32 --all       # 制限なし (デフォルト)
 
-# 表の URL 列はクリック可能 (対応ターミナル)。選択中に o キーでブラウザを開ける
+# 表の URL 列は "open" リンク (対応ターミナルではクリック可能)。選択中に o キーでブラウザを開ける
 
 # 4) 部品を追加 (シンボル・フットプリント・3D モデルを lib/ に配置)
 kicad-manager add esp32s3               # あいまい検索 → 選択

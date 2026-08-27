@@ -6,8 +6,10 @@ import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { loadConfig, saveConfig, resolveCredentials, isLoggedIn } from "./config.js";
 import { createProject, findProjectRoot, projectPaths, readSymbolLibBlocks, symbolNameOf } from "./kicad.js";
-import { search, downloadZip, getSamacId, partViewUrl, PartResult } from "./cse.js";
+import { search, searchPage, downloadZip, getSamacId, partViewUrl, PartResult } from "./cse.js";
 import { importZipIntoProject } from "./import.js";
+
+const MAX_LAZY_PAGES = 40;
 
 function fail(msg: string): never {
   process.stderr.write("error: " + msg + "\n");
@@ -31,10 +33,16 @@ interface TableCol {
   min?: number; // never shrink below this width
 }
 
-type Cell = string | { url: string };
+type Cell = string | { url: string; label: string };
 
-function cellText(c: Cell): string {
-  return typeof c === "string" ? c : c.url;
+interface Row {
+  cells: Cell[];
+  marquee: string;
+  url: string;
+}
+
+function cellText(c: Cell, links: boolean): string {
+  return typeof c === "string" ? c : links ? c.label : c.url;
 }
 
 function displayWidth(s: string): number {
@@ -76,14 +84,14 @@ function padTo(s: string, width: number): string {
   return s + " ".repeat(Math.max(0, width - displayWidth(s)));
 }
 
-function computeWidths(cols: TableCol[], rows: Cell[][]): { widths: number[]; flexIdx: number } {
+function computeWidths(cols: TableCol[], rows: Row[], links: boolean): { widths: number[]; flexIdx: number } {
   const termWidth = Math.max(50, Math.min(process.stdout.columns ?? 100, 200));
   const n = cols.length;
   const sepLen = 2;
   const FLEX_MIN = 10;
 
   const widths = cols.map((c, i) => {
-    const natural = Math.max(displayWidth(c.header), ...rows.map((r) => displayWidth(cellText(r[i] ?? ""))));
+    const natural = Math.max(displayWidth(c.header), ...rows.map((r) => displayWidth(cellText(r.cells[i] ?? "", links))));
     return c.flex ? natural : Math.min(natural, c.cap);
   });
 
@@ -115,18 +123,21 @@ function computeWidths(cols: TableCol[], rows: Cell[][]): { widths: number[]; fl
 function formatRow(cells: Cell[], widths: number[], flexIdx: number, links: boolean): string {
   return cells
     .map((cell, i) => {
-      const plain = cellText(cell);
+      const plain = cellText(cell, links);
       const t = truncateTo(plain, widths[i]);
       const isLink = typeof cell !== "string";
-      const rendered = isLink && links ? `\x1b]8;;${cell.url}\x1b\\${t}\x1b]8;;\x1b\\` : t;
+      const rendered =
+        isLink && links
+          ? `\x1b]8;;${cell.url}\x1b\\\x1b[4;34m${t}\x1b[0m\x1b]8;;\x1b\\`
+          : t;
       return i === flexIdx || i === widths.length - 1 ? rendered : padTo(rendered, widths[i]);
     })
     .join("  ")
     .trimEnd();
 }
 
-function renderTable(cols: TableCol[], rows: Cell[][], links = false): string[] {
-  const { widths, flexIdx } = computeWidths(cols, rows);
+function renderTable(cols: TableCol[], rows: Row[], links = false): string[] {
+  const { widths, flexIdx } = computeWidths(cols, rows, links);
   const lines: string[] = [];
   lines.push(formatRow(cols.map((c) => c.header), widths, flexIdx, links));
   lines.push(
@@ -137,7 +148,7 @@ function renderTable(cols: TableCol[], rows: Cell[][], links = false): string[] 
       links
     )
   );
-  for (const r of rows) lines.push(formatRow(r, widths, flexIdx, links));
+  for (const r of rows) lines.push(formatRow(r.cells, widths, flexIdx, links));
   return lines;
 }
 
@@ -156,30 +167,37 @@ function windowText(text: string, startChar: number, width: number): string {
 
 function selectFromTable(
   cols: TableCol[],
-  rows: Cell[][],
-  marquee: string[] | null = null,
-  openUrls: string[] | null = null
+  rows: Row[],
+  opts: {
+    totalKnown?: number;
+    loadMore?: () => Promise<Row[] | null>;
+  } = {}
 ): Promise<number | null> {
-  const total = rows.length;
   return new Promise((resolve) => {
     let idx = 0;
-    let { widths, flexIdx } = computeWidths(cols, rows);
+    let { widths, flexIdx } = computeWidths(cols, rows, true);
     let table = renderTable(cols, rows, true);
-    let maxVisible = Math.max(5, Math.min(total, (process.stdout.rows ?? 24) - 4));
+    let maxVisible = Math.max(5, Math.min(rows.length, (process.stdout.rows ?? 24) - 4));
 
     const TICK_MS = 90;
     const STEP = 2;
     const PAUSE_TICKS = 6;
+    const SPINNER = ["\u28fe", "\u28fd", "\u28fb", "\u28f7", "\u28ef", "\u28df", "\u28bf", "\u287f"];
 
     let offset = 0;
     let direction = 1;
     let pause = 0;
+    let loading = false;
+    let canLoad = Boolean(opts.loadMore);
+    let spinnerIdx = 0;
     let timer: NodeJS.Timeout | null = null;
 
+    const total = () => rows.length;
+
     const recalcLayout = () => {
-      ({ widths, flexIdx } = computeWidths(cols, rows));
+      ({ widths, flexIdx } = computeWidths(cols, rows, true));
       table = renderTable(cols, rows, true);
-      maxVisible = Math.max(5, Math.min(total, (process.stdout.rows ?? 24) - 4));
+      maxVisible = Math.max(5, Math.min(rows.length, (process.stdout.rows ?? 24) - 4));
     };
 
     const onResize = () => {
@@ -192,15 +210,15 @@ function selectFromTable(
     const startOf = () =>
       Math.min(
         Math.max(0, idx - Math.floor(maxVisible / 2)),
-        Math.max(0, total - maxVisible)
+        Math.max(0, rows.length - maxVisible)
       );
 
     const rowLine = (k: number, withMarquee: boolean): string => {
       let line = table[k + 2];
-      if (withMarquee && marquee && flexIdx >= 0) {
-        const text = marquee[k] ?? "";
+      if (withMarquee && flexIdx >= 0) {
+        const text = rows[k].marquee;
         if (displayWidth(text) > widths[flexIdx]) {
-          const cells = rows[k].slice();
+          const cells = rows[k].cells.slice();
           cells[flexIdx] = windowText(text, offset, widths[flexIdx]);
           line = formatRow(cells, widths, flexIdx, true);
         }
@@ -208,26 +226,46 @@ function selectFromTable(
       return k === idx ? "\x1b[7m" + line + "\x1b[0m" : line;
     };
 
+    const promptLine = (): string => {
+      const loaded = rows.length;
+      const known = opts.totalKnown ?? 0;
+      const pos = `[${idx + 1}/${loaded}${known > loaded ? ` \u00b7 ${known} total` : ""}]`;
+      const base = `Use \u2191/\u2193 to move, Enter to select, o to open URL, q to cancel  ${pos}`;
+      if (loading) return `${base}  Searching\u2026 ${SPINNER[spinnerIdx % SPINNER.length]}`;
+      if (canLoad && idx >= loaded - 3) return `${base}  (\u2193 for more)`;
+      return base;
+    };
+
     const render = () => {
       const start = startOf();
-      const promptLine = openUrls
-        ? `Use \u2191/\u2193 to move, Enter to select, o to open URL, q to cancel  [${idx + 1}/${total}]`
-        : `Use \u2191/\u2193 to move, Enter to select, q to cancel  [${idx + 1}/${total}]`;
       readline.cursorTo(process.stdout, 0, 0);
       const out: string[] = [];
       out.push(table[0]);
       out.push(table[1]);
-      for (let k = start; k < start + maxVisible; k++) {
+      for (let k = start; k < start + maxVisible && k < rows.length; k++) {
         out.push(rowLine(k, k === idx));
       }
-      out.push(promptLine);
+      out.push(promptLine());
       process.stdout.write(out.join("\n"));
       readline.clearLine(process.stdout, 1);
     };
 
+    const promptScreenRow = (): number => 2 + Math.min(maxVisible, rows.length);
+
+    const renderPromptOnly = () => {
+      readline.cursorTo(process.stdout, 0, promptScreenRow());
+      process.stdout.write(promptLine());
+      readline.clearLine(process.stdout, 1);
+    };
+
     const tick = () => {
-      if (!marquee || flexIdx < 0) return;
-      const text = marquee[idx] ?? "";
+      if (loading) {
+        spinnerIdx++;
+        renderPromptOnly();
+        return;
+      }
+      if (flexIdx < 0) return;
+      const text = rows[idx].marquee;
       if (displayWidth(text) <= widths[flexIdx]) return;
       if (pause > 0) {
         pause--;
@@ -257,6 +295,26 @@ function selectFromTable(
       pause = PAUSE_TICKS;
     };
 
+    const doLoad = async () => {
+      if (loading || !opts.loadMore || !canLoad) return;
+      loading = true;
+      renderPromptOnly();
+      const newRows = await opts.loadMore();
+      if (newRows && newRows.length > 0) {
+        rows.push(...newRows);
+        recalcLayout();
+      } else {
+        canLoad = false;
+      }
+      loading = false;
+      render();
+    };
+
+    const maybeLoad = () => {
+      if (!canLoad || loading) return;
+      if (idx >= rows.length - 3) void doLoad();
+    };
+
     readline.emitKeypressEvents(process.stdin);
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -273,18 +331,23 @@ function selectFromTable(
       }
       switch (key.name) {
         case "up":
-          idx = (idx - 1 + total) % total;
+          idx = (idx - 1 + rows.length) % rows.length;
           resetMarquee();
           render();
           break;
         case "down":
-          idx = (idx + 1) % total;
-          resetMarquee();
-          render();
+          if (idx < rows.length - 1) {
+            idx++;
+            resetMarquee();
+            render();
+            maybeLoad();
+          } else {
+            maybeLoad();
+          }
           break;
         case "o":
-          if (openUrls && openUrls[idx]) {
-            openUrl(openUrls[idx]);
+          if (rows[idx].url) {
+            openUrl(rows[idx].url);
             resetMarquee();
             render();
           }
@@ -366,50 +429,112 @@ async function confirm(q: string): Promise<boolean> {
   return /^y(es)?$/i.test(a.trim());
 }
 
-function partTableCols(): TableCol[] {
-  return [
-    { header: "#", cap: 3 },
+function partTableCols(includeIndex: boolean): TableCol[] {
+  const cols: TableCol[] = [];
+  if (includeIndex) cols.push({ header: "#", cap: 3 });
+  cols.push(
     { header: "Part Number", cap: 32, min: 10 },
     { header: "Manufacturer", cap: 20, min: 8 },
-    { header: "URL", cap: 34, min: 20 },
+    { header: "URL", cap: 34, min: 4 },
     { header: "Model", cap: 5, min: 5 },
-    { header: "Description", cap: Infinity, flex: true },
-  ];
+    { header: "Description", cap: Infinity, flex: true }
+  );
+  return cols;
 }
 
-function partTableRows(results: PartResult[]): Cell[][] {
-  return results.map((r, i) => [
-    String(i + 1),
-    r.mpn,
-    r.manufacturer,
-    { url: partViewUrl(r.mpn, r.manufacturer) },
-    r.hasModel ? "\u2713" : "\u2717",
-    r.description,
-  ]);
-}
-
-async function choosePart(results: PartResult[]): Promise<PartResult | null> {
-  const cols = partTableCols();
-  const rows = partTableRows(results);
-
-  if (process.stdin.isTTY && process.stdout.isTTY) {
-    process.stdout.write("\n");
-    const idx = await selectFromTable(
-      cols,
-      rows,
-      results.map((r) => r.description),
-      results.map((r) => partViewUrl(r.mpn, r.manufacturer))
+function partRows(results: PartResult[], includeIndex: boolean, startIndex = 0): Row[] {
+  return results.map((r, i) => {
+    const cells: Cell[] = [];
+    if (includeIndex) cells.push(String(startIndex + i + 1));
+    cells.push(
+      r.mpn,
+      r.manufacturer,
+      { url: partViewUrl(r.mpn, r.manufacturer), label: "open" },
+      r.hasModel ? "\u2713" : "\u2717",
+      r.description
     );
-    if (idx === null) return null;
-    return results[idx];
-  }
+    return { cells, marquee: r.description, url: partViewUrl(r.mpn, r.manufacturer) };
+  });
+}
 
+function choosePartStatic(results: PartResult[]): Promise<PartResult | null> {
+  const cols = partTableCols(true);
+  const rows = partRows(results, true);
   for (const ln of renderTable(cols, rows)) process.stdout.write(ln + "\n");
-  const answer = await prompt("Select a number (or q to cancel): ");
-  if (/^q$/i.test(answer.trim())) return null;
-  const n = Number(answer);
-  if (Number.isInteger(n) && n >= 1 && n <= results.length) return results[n - 1];
-  return null;
+  return (async () => {
+    const answer = await prompt("Select a number (or q to cancel): ");
+    if (/^q$/i.test(answer.trim())) return null;
+    const n = Number(answer);
+    if (Number.isInteger(n) && n >= 1 && n <= results.length) return results[n - 1];
+    return null;
+  })();
+}
+
+interface LazyOpts {
+  maxRows: number;
+  manufacturer?: string;
+  exactTerm?: string;
+}
+
+async function choosePartLazy(term: string, opts: LazyOpts): Promise<PartResult | null> {
+  const matches = (r: PartResult) =>
+    !opts.manufacturer || r.manufacturer.toLowerCase() === opts.manufacturer.toLowerCase();
+
+  const first = await searchPage(term, 1);
+  const totalKnown = first.total;
+
+  const exact = opts.exactTerm
+    ? first.results.find((r) => r.mpn.toLowerCase() === opts.exactTerm!.toLowerCase() && matches(r))
+    : undefined;
+  if (exact) return exact;
+
+  const all: PartResult[] = [];
+  const addResults = (rs: PartResult[]) => {
+    for (const r of rs) {
+      if (matches(r)) all.push(r);
+    }
+  };
+  addResults(first.results);
+  if (all.length === 0) return null;
+
+  let page = 1;
+  let exhausted = false;
+  const rows = partRows(all, false);
+
+  const loadMore = async (): Promise<Row[] | null> => {
+    if (exhausted) return null;
+    if (Number.isFinite(opts.maxRows) && all.length >= opts.maxRows) {
+      exhausted = true;
+      return null;
+    }
+    let added: PartResult[] = [];
+    for (let guard = 0; guard < MAX_LAZY_PAGES; guard++) {
+      page++;
+      const p = await searchPage(term, page);
+      if (p.results.length === 0) {
+        exhausted = true;
+        break;
+      }
+      const filtered = p.results.filter(matches);
+      if (filtered.length > 0) {
+        const room = Number.isFinite(opts.maxRows) ? opts.maxRows - all.length : Infinity;
+        added = filtered.slice(0, room);
+        break;
+      }
+    }
+    if (added.length === 0) {
+      exhausted = true;
+      return null;
+    }
+    const newRows = partRows(added, false);
+    all.push(...added);
+    return newRows;
+  };
+
+  const cols = partTableCols(false);
+  const idx = await selectFromTable(cols, rows, { totalKnown, loadMore });
+  if (idx === null) return null;
+  return all[idx];
 }
 
 function partLabel(r: PartResult): string {
@@ -450,36 +575,62 @@ interface SearchOpts {
   all?: boolean;
 }
 
-function searchLimit(opts: SearchOpts): number {
+function searchLimit(opts: SearchOpts): number | null {
   if (opts.all) return Infinity;
   if (opts.limit) {
     const n = parseInt(opts.limit, 10);
     if (Number.isInteger(n) && n > 0) return n;
     fail(`Invalid --limit value: ${opts.limit}`);
   }
-  return 75;
+  return null;
+}
+
+function isTty(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
 }
 
 async function cmdSearch(term: string | undefined, opts: { json?: boolean; add?: boolean; limit?: string; all?: boolean }) {
   if (!term) fail("Search term is required.");
-  process.stdout.write(`Searching Component Search Engine for "${term}"...\n`);
-  const { results, total } = await search(term, { limit: searchLimit(opts) });
-  if (results.length === 0) {
-    process.stdout.write("No results found.\n");
-    return;
-  }
 
   if (opts.json) {
+    process.stdout.write(`Searching Component Search Engine for "${term}"...\n`);
+    const { results, total } = await search(term, { limit: searchLimit(opts) ?? 75 });
+    if (results.length === 0) {
+      process.stdout.write("No results found.\n");
+      return;
+    }
     process.stdout.write(JSON.stringify({ total, count: results.length, results }, null, 2) + "\n");
     return;
   }
 
+  if (isTty()) {
+    process.stdout.write(`Searching Component Search Engine for "${term}"...\n`);
+    const chosen = await choosePartLazy(term, { maxRows: searchLimit(opts) ?? Infinity });
+    if (!chosen) {
+      process.stdout.write("Cancelled.\n");
+      return;
+    }
+    const wantAdd = opts.add ?? (await confirm(`\nAdd ${partLabel(chosen)} to the project?`));
+    if (!wantAdd) {
+      process.stdout.write(`Run 'kicad-manager add "${chosen.mpn}"' to add it.\n`);
+      return;
+    }
+    await downloadAndInstall({ mpn: chosen.mpn, manufacturer: chosen.manufacturer }, partLabel(chosen));
+    return;
+  }
+
+  process.stdout.write(`Searching Component Search Engine for "${term}"...\n`);
+  const { results, total } = await search(term, { limit: searchLimit(opts) ?? 75 });
+  if (results.length === 0) {
+    process.stdout.write("No results found.\n");
+    return;
+  }
   if (total > results.length) {
     process.stdout.write(`Found ${results.length} of ${total} result(s) (use --all to fetch all):\n\n`);
   } else {
     process.stdout.write(`Found ${results.length} result(s):\n\n`);
   }
-  const chosen = await choosePart(results);
+  const chosen = await choosePartStatic(results);
   if (!chosen) {
     process.stdout.write("Cancelled.\n");
     return;
@@ -513,7 +664,22 @@ async function cmdAdd(
 
   const query = term as string;
   process.stdout.write(`Searching for "${query}"...\n`);
-  const { results, total } = await search(query, { limit: searchLimit(opts) });
+
+  if (isTty()) {
+    const chosen = await choosePartLazy(query, {
+      maxRows: searchLimit(opts) ?? Infinity,
+      manufacturer: opts.manufacturer,
+      exactTerm: query,
+    });
+    if (!chosen) {
+      process.stdout.write("Cancelled.\n");
+      return;
+    }
+    await downloadAndInstall({ mpn: chosen.mpn, manufacturer: chosen.manufacturer }, partLabel(chosen));
+    return;
+  }
+
+  const { results, total } = await search(query, { limit: searchLimit(opts) ?? 75 });
   if (results.length === 0) fail(`No results for "${query}".`);
 
   let chosen: PartResult | undefined;
@@ -529,7 +695,7 @@ async function cmdAdd(
       process.stdout.write(`No exact match in first ${results.length} of ${total} results. Try --all for a full search.\n`);
     }
     process.stdout.write(`Multiple matches for "${term}":\n`);
-    chosen = (await choosePart(results)) ?? undefined;
+    chosen = (await choosePartStatic(results)) ?? undefined;
     if (!chosen) {
       process.stdout.write("Cancelled.\n");
       return;

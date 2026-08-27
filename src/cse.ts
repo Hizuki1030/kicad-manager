@@ -65,28 +65,40 @@ export interface SearchPage {
   total: number;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export async function searchPage(term: string, page: number): Promise<SearchPage> {
   const url = `${BASE}/search?term=${encodeURIComponent(term)}&page=${page}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-  if (res.status === 403) {
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await sleep(600 * attempt);
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    lastStatus = res.status;
+    if (res.status === 403 || res.status === 429 || res.status >= 500) continue;
+    if (!res.ok) {
+      if (page === 1) throw new Error(`Search failed (HTTP ${res.status})`);
+      return { results: [], total: 0 };
+    }
+    const html = await res.text();
+    const m = html.match(/of <strong>(\d+) results/);
+    const total = m ? parseInt(m[1], 10) : 0;
+    return { results: parseSearchResults(html), total };
+  }
+  if (lastStatus === 403) {
     throw new Error(
       "Search blocked by Component Search Engine (HTTP 403). Try again, or use 'kicad-manager add --id <partID>' with an ID from componentsearchengine.com."
     );
   }
-  if (!res.ok) {
-    if (page === 1) throw new Error(`Search failed (HTTP ${res.status})`);
-    return { results: [], total: 0 };
-  }
-  const html = await res.text();
-  const m = html.match(/of <strong>(\d+) results/);
-  const total = m ? parseInt(m[1], 10) : 0;
-  return { results: parseSearchResults(html), total };
+  if (page === 1) throw new Error(`Search failed (HTTP ${lastStatus})`);
+  return { results: [], total: 0 };
 }
 
 export async function search(

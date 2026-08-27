@@ -189,6 +189,7 @@ function selectFromTable(
     let pause = 0;
     let loading = false;
     let canLoad = Boolean(opts.loadMore);
+    let loadError = "";
     let spinnerIdx = 0;
     let timer: NodeJS.Timeout | null = null;
 
@@ -232,6 +233,7 @@ function selectFromTable(
       const pos = `[${idx + 1}/${loaded}${known > loaded ? ` \u00b7 ${known} total` : ""}]`;
       const base = `Use \u2191/\u2193 to move, Enter to select, o to open URL, q to cancel  ${pos}`;
       if (loading) return `${base}  Searching\u2026 ${SPINNER[spinnerIdx % SPINNER.length]}`;
+      if (loadError) return `${base}  \u26a0 ${truncateTo(loadError, 60)} (\u2193 to retry)`;
       if (canLoad && idx >= loaded - 3) return `${base}  (\u2193 for more)`;
       return base;
     };
@@ -298,13 +300,18 @@ function selectFromTable(
     const doLoad = async () => {
       if (loading || !opts.loadMore || !canLoad) return;
       loading = true;
+      loadError = "";
       renderPromptOnly();
-      const newRows = await opts.loadMore();
-      if (newRows && newRows.length > 0) {
-        rows.push(...newRows);
-        recalcLayout();
-      } else {
-        canLoad = false;
+      try {
+        const newRows = await opts.loadMore();
+        if (newRows && newRows.length > 0) {
+          rows.push(...newRows);
+          recalcLayout();
+        } else {
+          canLoad = false;
+        }
+      } catch (err) {
+        loadError = err instanceof Error ? err.message : String(err);
       }
       loading = false;
       render();
@@ -509,6 +516,7 @@ async function choosePartLazy(term: string, opts: LazyOpts): Promise<PartResult 
     }
     let added: PartResult[] = [];
     for (let guard = 0; guard < MAX_LAZY_PAGES; guard++) {
+      await new Promise((r) => setTimeout(r, 250));
       page++;
       const p = await searchPage(term, page);
       if (p.results.length === 0) {

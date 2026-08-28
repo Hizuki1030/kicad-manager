@@ -50,12 +50,13 @@ function symLibTable(): string {
 }
 
 function emptySymLib(): string {
-  return '(kicad_symbol_lib (version 20220914) (generator "kicad-manager")\n)\n';
+  return '(kicad_symbol_lib (version 20241209) (generator "kicad-manager")\n)\n';
 }
 
 function emptySch(): string {
   return [
-    '(kicad_sch (version 20231120) (generator "kicad-manager") (generator_version "8.0")',
+    "(kicad_sch",
+    "  (version 20250114)",
     '  (uuid "' + crypto.randomUUID() + '")',
     '  (paper "A4")',
     "  (lib_symbols)",
@@ -67,7 +68,8 @@ function emptySch(): string {
 
 function emptyPcb(): string {
   return [
-    '(kicad_pcb (version 20240108) (generator "kicad-manager") (generator_version "8.0")',
+    "(kicad_pcb",
+    "  (version 20241229)",
     "  (general",
     '    (thickness 1.6)',
     '    (legacy_teardrops no)',
@@ -264,7 +266,7 @@ function kicadProObject(name: string): Record<string, unknown> {
       },
     },
     libraries: { pinned_footprint_libs: [], pinned_symbol_libs: [] },
-    meta: { filename: name, version: 1 },
+    meta: { filename: name, version: 3 },
     net_settings: {
       classes: [
         {
@@ -278,6 +280,7 @@ function kicadProObject(name: string): Record<string, unknown> {
           microvia_drill: 0.1,
           name: "Default",
           pcb_color: "rgba(0, 0, 0, 0.000)",
+          priority: 2147483647,
           schematic_color: "rgba(0, 0, 0, 0.000)",
           track_width: 0.2,
           via_diameter: 0.6,
@@ -285,7 +288,7 @@ function kicadProObject(name: string): Record<string, unknown> {
           wire_width: 6,
         },
       ],
-      meta: { version: 3 },
+      meta: { version: 4 },
       net_colors: null,
       netclass_assignments: null,
       netclass_patterns: [],
@@ -475,7 +478,7 @@ export function readSymbolLibBlocks(libPath: string): string[] {
 }
 
 export function writeSymbolLib(libPath: string, blocks: string[]): void {
-  let out = '(kicad_symbol_lib (version 20220914) (generator "kicad-manager")\n';
+  let out = '(kicad_symbol_lib (version 20241209) (generator "kicad-manager")\n';
   for (const b of blocks) {
     out += "  " + b + "\n";
   }

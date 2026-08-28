@@ -48,6 +48,10 @@ kicad-manager add --id <SamacSys Part ID>   # 検索をスキップして直接�
 
 # その他
 kicad-manager list    # プロジェクト内の部品一覧
+
+# タブ補完 (zsh/bash)
+kicad-manager completion zsh --install   # ~/.zshrc に追記 (bash は completion bash --install)
+source ~/.zshrc                          # 適用 (またはシェル再起動)
 ```
 
 `add` するとシンボルは `lib/lib.kicad_sym` にマージされ、

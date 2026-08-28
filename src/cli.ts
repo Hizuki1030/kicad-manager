@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
@@ -191,6 +192,8 @@ function selectFromTable(
     let canLoad = Boolean(opts.loadMore);
     let loadError = "";
     let spinnerIdx = 0;
+    let openMsg = "";
+    let openMsgTicks = 0;
     let timer: NodeJS.Timeout | null = null;
 
     const total = () => rows.length;
@@ -233,6 +236,7 @@ function selectFromTable(
       const pos = `[${idx + 1}/${loaded}${known > loaded ? ` \u00b7 ${known} total` : ""}]`;
       const base = `Use \u2191/\u2193 to move, Enter to select, o to open URL, q to cancel  ${pos}`;
       if (loading) return `${base}  Searching\u2026 ${SPINNER[spinnerIdx % SPINNER.length]}`;
+      if (openMsg) return `${base}  ${openMsg}`;
       if (loadError) return `${base}  \u26a0 ${truncateTo(loadError, 60)} (\u2193 to retry)`;
       if (canLoad && idx >= loaded - 3) return `${base}  (\u2193 for more)`;
       return base;
@@ -261,6 +265,14 @@ function selectFromTable(
     };
 
     const tick = () => {
+      if (openMsgTicks > 0) {
+        openMsgTicks--;
+        if (openMsgTicks === 0) {
+          openMsg = "";
+          renderPromptOnly();
+        }
+        return;
+      }
       if (loading) {
         spinnerIdx++;
         renderPromptOnly();
@@ -355,6 +367,8 @@ function selectFromTable(
         case "o":
           if (rows[idx].url) {
             openUrl(rows[idx].url);
+            openMsg = "\u2197 Opened part page in browser";
+            openMsgTicks = 18;
             resetMarquee();
             render();
           }
@@ -822,6 +836,119 @@ program
   .command("list")
   .description("List footprints and symbols in the current project")
   .action(() => cmdList());
+
+// ---------------------------------------------------------------------------
+// Shell completion
+// ---------------------------------------------------------------------------
+
+const ZSH_COMPLETION = `#compdef kicad-manager
+
+_kicad-manager() {
+  local -a commands
+  commands=(
+    'create:Create a new KiCad project with project libraries'
+    'search:Search Component Search Engine and interactively pick a part'
+    'add:Add a part (symbol + footprint + 3D model) to the project'
+    'login:Store Component Search Engine credentials'
+    'list:List footprints and symbols in the current project'
+    'completion:Output shell completion script'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+  case $words[2] in
+    search)
+      _arguments \\
+        '--json[print raw JSON results]' \\
+        '--add[skip confirmation and go straight to adding]' \\
+        '--limit[n: maximum number of results to fetch]:n:' \\
+        '--all[fetch all search results]' \\
+        '1:search term:'
+      ;;
+    add)
+      _arguments \\
+        '--id[SamacSys part ID for direct download]:id:' \\
+        '(-m --manufacturer)'{-m,--manufacturer}'[manufacturer filter]:manufacturer:' \\
+        '--limit[n: maximum number of results to fetch]:n:' \\
+        '--all[search through all results]' \\
+        '1:part number or keyword:'
+      ;;
+    create)
+      _arguments \\
+        '(-d --dir)'{-d,--dir}'[parent directory]:directory:_files -/' \\
+        '1:project name:'
+      ;;
+    login)
+      _arguments \\
+        '(-u --username)'{-u,--username}'[CSE username/email]:username:' \\
+        '(-p --password)'{-p,--password}'[CSE password]:password:'
+      ;;
+    list)
+      ;;
+    completion)
+      _values 'shell' zsh bash
+      ;;
+  esac
+}
+
+compdef _kicad-manager kicad-manager
+`;
+
+const BASH_COMPLETION = `_kicad-manager() {
+  local cur commands
+  COMPREPLY=()
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  commands="create search add login list completion"
+  if [[ \${COMP_CWORD} -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "\${commands}" -- "\${cur}") )
+    return 0
+  fi
+  case "\${COMP_WORDS[1]}" in
+    search) COMPREPLY=( $(compgen -W "--json --add --limit --all" -- "\${cur}") ) ;;
+    add)    COMPREPLY=( $(compgen -W "--id -m --manufacturer --limit --all" -- "\${cur}") ) ;;
+    create) COMPREPLY=( $(compgen -W "-d --dir" -- "\${cur}") ) ;;
+    login)  COMPREPLY=( $(compgen -W "-u --username -p --password" -- "\${cur}") ) ;;
+    completion) COMPREPLY=( $(compgen -W "zsh bash" -- "\${cur}") ) ;;
+  esac
+  return 0
+}
+complete -F _kicad-manager kicad-manager
+`;
+
+function cmdCompletion(shell: string | undefined, opts: { install?: boolean }) {
+  const sh = shell === "bash" ? "bash" : "zsh";
+  const script = sh === "bash" ? BASH_COMPLETION : ZSH_COMPLETION;
+  if (!opts.install) {
+    process.stdout.write(script);
+    return;
+  }
+  const rcPath = path.join(os.homedir(), sh === "bash" ? ".bashrc" : ".zshrc");
+  const block =
+    sh === "bash"
+      ? `# kicad-manager completion\nsource <(kicad-manager completion bash)\n`
+      : `# kicad-manager completion\n(( $+functions[compdef] )) || { autoload -Uz compinit; compinit }\neval "$(kicad-manager completion zsh)"\n`;
+  let rc = "";
+  try {
+    rc = fs.readFileSync(rcPath, "utf8");
+  } catch {
+    /* rc file does not exist yet */
+  }
+  if (rc.includes("kicad-manager completion")) {
+    process.stdout.write(`Completion is already installed in ${rcPath}\n`);
+    return;
+  }
+  fs.writeFileSync(rcPath, (rc.endsWith("\n") || rc === "" ? rc : rc + "\n") + block);
+  process.stdout.write(`Installed ${sh} completion in ${rcPath}\n`);
+  process.stdout.write(`Restart your shell or run: source ${rcPath}\n`);
+}
+
+program
+  .command("completion")
+  .description("Output shell completion script (zsh or bash)")
+  .argument("[shell]", "zsh or bash", "zsh")
+  .option("--install", "install completion into ~/.zshrc or ~/.bashrc")
+  .action((shell, opts) => cmdCompletion(shell, opts));
 
 async function main(): Promise<void> {
   try {
